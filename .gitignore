@@ -129,6 +129,7 @@ dmypy.json
 .pyre/
 
 /data/*
+/Data/*
 
 # OS generated files #
 ######################
