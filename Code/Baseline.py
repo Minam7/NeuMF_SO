@@ -1,96 +1,106 @@
 from lightfm import LightFM
-from lightfm.evaluation import precision_at_k
-from lightfm.evaluation import auc_score
-from lightfm.evaluation import recall_at_k
-from lightfm.evaluation import reciprocal_rank
-
-from lightfm.datasets import fetch_movielens
-from lightfm.data import Dataset
-
+from Dataset import Dataset
 from math import log
 import numpy as np
-from scipy import sparse
-from scipy.sparse import identity
-from operator import itemgetter
+import scipy.sparse as sp
 import pandas as pd
+from time import time
+from evaluate import evaluate_model
+import argparse
+
+#################### Arguments ####################
+def parse_args():
+    parser = argparse.ArgumentParser(description="Run MF.")
+    parser.add_argument('--path', nargs='?', default='Data/',
+                        help='Input data path.')
+    parser.add_argument('--dataset', nargs='?', default='so',
+                        help='Choose a dataset.')
+    parser.add_argument('--epochs', type=int, default=100,
+                        help='Number of epochs.')
+    parser.add_argument('--num_factors', type=int, default=8,
+                        help='Embedding size.')
+    parser.add_argument('--num_neg', type=int, default=4,
+                        help='Number of negative instances to pair with a positive instance.')
+    parser.add_argument('--lr', type=float, default=0.001,
+                        help='Learning rate.')
+    parser.add_argument('--verbose', type=int, default=1,
+                        help='Show performance per X iterations')
+    return parser.parse_args()
 
 
-def ndcg_at_k(model, user_ids, item_ids, actual_scores, item_features=None, user_features=None, k=10):
-    pred_scores = []
-    ndcg_k = []
-    for user in user_ids:
-        pred_score = model.predict(user_ids=user_ids,
-                                   item_ids=item_ids)
-        pred_score = (pred_score / sum(pred_score)) * 10000
-        pred_scores.append(pred_score.tolist())
-
-    matrix = np.array(pred_scores)
-    pred_scores = sparse.csr_matrix(matrix)
-    scores = []
-    real_scores = []
-    actual_scores = actual_scores.tocsr()
-    for i in range(0, 943):
-        for j in range(0, 1682):
-            scores.append((j, pred_scores[i, j]))
-            try:
-                real_scores.append((j, actual_scores[i, j]))
-            except:
-                real_scores.append((j, 0))
-
-        scores.sort(key=itemgetter(1), reverse=True)
-        real_scores.sort(key=itemgetter(1), reverse=True)
-        total = 0
-        ideal_total = 0
-        for n in range(0, k):
-            total += real_scores[scores[n][0]][1] / log(n + 2, 2)
-            ideal_total += real_scores[n][1] / log(n + 2, 2)
-
-        if ideal_total != 0:
-            ndcg_k.append(total / ideal_total)
-
-    return ndcg_k
+def get_train_instances(train, num_negatives):
+    user_input, item_input, labels = [],[],[]
+    num_users = train.shape[0]
+    for (u, i) in train.keys():
+        # positive instance
+        user_input.append(u)
+        item_input.append(i)
+        labels.append(1)
+        # negative instances
+        for t in xrange(num_negatives):
+            j = np.random.randint(num_items)
+            while train.has_key((u, j)):
+                j = np.random.randint(num_items)
+            user_input.append(u)
+            item_input.append(j)
+            labels.append(0)
+    return user_input, item_input, labels
 
 
-movielens = fetch_movielens(indicator_features=True, genre_features=True)
+if __name__ == '__main__':
+    args = parse_args()
+    num_factors = args.num_factors
+    num_negatives = args.num_neg
+    learning_rate = args.lr
+    epochs = args.epochs
+    verbose = args.verbose
+    
+    
+    topK = 10
+    evaluation_threads = 1
+    
+    print("MF arguments: %s" %(args))
 
-train = movielens['train']
-test = movielens['test']
 
-row = []
-col = []
-val = []
-file = open('data/ml-100k/u.data', encoding="ISO-8859-1")
-for line in file:
-    interaction = []
-    data = line.split('\t')
-    row.append(int(data[0]))
-    col.append(int(data[1]))
-    val.append(int(data[2]))
+    # Loading data
+    t1 = time()
+    dataset = Dataset(args.path + args.dataset)
+    train, testRatings, testNegatives = dataset.trainMatrix, dataset.testRatings, dataset.testNegatives
+    num_users, num_items = train.shape
+    print("Load data done [%.1f s]. #user=%d, #item=%d, #train=%d, #test=%d" 
+          %(time()-t1, num_users, num_items, train.nnz, len(testRatings)))
+    
+    # Build model
+    model = LightFM(learning_rate=learning_rate, loss='warp')
+    
+    # Train model
+    best_hr, best_ndcg, best_iter = 0, 0, -1
+    for epoch in xrange(epochs):
+        t1 = time()
+        # Generate training instances
+        user_input, item_input, labels = get_train_instances(train, num_negatives)
+        
+        # Training
+        hist = model.fit_partial(train, epochs=1)
+        t2 = time()
+        
+        # Evaluation
+        if epoch %verbose == 0:
+            (hits, ndcgs) = evaluate_model(model, testRatings, testNegatives, topK, evaluation_threads)
+            hr, ndcg = np.array(hits).mean(), np.array(ndcgs).mean()
+            print('Iteration %d [%.1f s]: HR = %.4f, NDCG = %.4f, [%.1f s]' 
+                  % (epoch,  t2-t1, hr, ndcg, time()-t2))
+            if hr > best_hr:
+                best_hr, best_ndcg, best_iter = hr, ndcg, epoch
 
-actual_data = sparse.coo_matrix((val, (row, col)), dtype=np.float32)
+    print("End. Best Iteration %d:  HR = %.4f, NDCG = %.4f. " %(best_iter, best_hr, best_ndcg))
+    
 
-model = LightFM(learning_rate=0.1, loss='warp')
-model.fit(train, epochs=10)
-
-train_precision = precision_at_k(model, train, k=10).mean()
-test_precision = precision_at_k(model, test, k=10).mean()
-
-train_recall = recall_at_k(model, train, k=10).mean()
-test_recall = recall_at_k(model, test, k=10).mean()
-
-train_auc = auc_score(model, train).mean()
-test_auc = auc_score(model, test).mean()
-
-print('Precision: train %.2f, test %.2f.' % (train_precision, test_precision))
-print('Recall: train %.2f, test %.2f.' % (train_recall, test_recall))
-print('AUC: train %.2f, test %.2f.' % (train_auc, test_auc))
-
-ndcg = ndcg_at_k(model,
-                 user_ids=np.array([x for x in range(0, 943)]),
-                 item_ids=np.array([x for x in range(0, 1682)]),
-                 actual_scores=actual_data,
-                 k=10)
-
-print(ndcg)
-
-# print("-----------------------")
+    
+    
+    
+    
+    
+    
+    
+    
